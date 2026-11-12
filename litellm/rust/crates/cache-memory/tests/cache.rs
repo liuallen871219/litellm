@@ -241,6 +241,21 @@ fn reinserting_expired_keys_below_capacity_prunes_the_heap(clock: Clock) {
 }
 
 #[rstest]
+fn refreshing_a_key_behind_an_earlier_live_key_keeps_the_heap_bounded(clock: Clock) {
+    let cache = cache(&clock, 2);
+    cache.set_cache("older", "pin".into(), secs(3600)).unwrap();
+    for second in 1..=100 {
+        at(&clock, 100 + second);
+        cache.delete_cache("refreshed").unwrap();
+        cache
+            .set_cache("refreshed", "pin".into(), secs(3600))
+            .unwrap();
+    }
+    assert_eq!(cache.get_cache("older"), Ok(Some("pin".into())));
+    assert!(cache.expiration_heap_len().unwrap() <= 5);
+}
+
+#[rstest]
 fn evict_cache_drops_expired_entries_then_makes_room(clock: Clock) {
     let cache = cache(&clock, 2);
     assert_eq!(cache.is_empty(), Ok(true));

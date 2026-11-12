@@ -258,6 +258,15 @@ impl<V: Clone> InMemoryCache<V> {
                 break;
             }
         }
+        if state.expiration_heap.len() > capacity.saturating_mul(2) {
+            let CacheState {
+                expirations,
+                expiration_heap,
+                ..
+            } = state;
+            expiration_heap
+                .retain(|Reverse((expiration, key))| expirations.get(key) == Some(expiration));
+        }
         if key.is_some_and(|key| state.values.contains_key(key)) {
             return;
         }
