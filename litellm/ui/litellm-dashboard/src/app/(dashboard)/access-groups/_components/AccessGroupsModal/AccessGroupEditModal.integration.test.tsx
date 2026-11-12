@@ -45,6 +45,10 @@ vi.mock("@/components/skills/SkillSelector", () => ({
   ),
 }));
 
+vi.mock("@/app/(dashboard)/hooks/useAuthorized", () => ({
+  default: () => ({ accessToken: "sk-test" }),
+}));
+
 vi.mock("@/lib/toast", () => ({
   toast: { success: vi.fn(), fromError: vi.fn(), error: vi.fn() },
 }));
@@ -61,6 +65,7 @@ const accessGroup: AccessGroupResponse = {
   mcp_tool_permissions: { "srv-1": ["read_file"] },
   access_agent_ids: ["agent-1"],
   access_skill_names: ["old-plugin"],
+  access_vector_store_ids: ["store-old"],
   assigned_team_ids: [],
   assigned_key_ids: [],
   access_mcp_servers: [{ id: "srv-1", name: "Server One" }],
@@ -80,10 +85,23 @@ const save = async (user: User) => user.click(screen.getByRole("button", { name:
 
 const variables = () => mutate.mock.calls.at(-1)?.[0] as { accessGroupId: string; params: Record<string, unknown> };
 
+const pickVectorStore = async (user: User, label: string) => {
+  await screen.findByLabelText("Old store (store-old)");
+  await user.click(screen.getByLabelText("Select vector stores (optional)"));
+  await user.click(await screen.findByRole("option", { name: new RegExp(label.replace(/[()]/g, "\\$&")) }));
+  await user.keyboard("{Escape}");
+};
+
 describe("AccessGroupEditModal submit payload", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     vi.mocked(networking.fetchMCPToolsets).mockResolvedValue([]);
+    vi.mocked(networking.vectorStoreListCall).mockResolvedValue({
+      data: [
+        { vector_store_id: "store-old", vector_store_name: "Old store" },
+        { vector_store_id: "store-new", vector_store_name: "New store" },
+      ],
+    });
     vi.mocked(networking.fetchMCPAccessGroups).mockResolvedValue([]);
     vi.mocked(networking.fetchMCPServers).mockResolvedValue([
       { server_id: "srv-1", server_name: "Files", alias: "Files" },
@@ -115,6 +133,7 @@ describe("AccessGroupEditModal submit payload", () => {
       access_mcp_server_ids: undefined,
       access_agent_ids: undefined,
       access_skill_names: undefined,
+      access_vector_store_ids: undefined,
     });
   });
 
@@ -145,6 +164,47 @@ describe("AccessGroupEditModal submit payload", () => {
     expect(variables().params.access_skill_names).toStrictEqual([]);
   });
 
+  it("sends the vector stores picked on the Vector Stores tab", async () => {
+    const user = setup();
+    renderModal();
+    await screen.findByDisplayValue("Engineering");
+
+    await user.click(screen.getByRole("tab", { name: /Vector Stores/ }));
+    await pickVectorStore(user, "New store (store-new)");
+    await save(user);
+
+    await waitFor(() => expect(mutate).toHaveBeenCalled());
+    expect(variables().params.access_vector_store_ids).toStrictEqual(["store-old", "store-new"]);
+    expect(variables().params.access_skill_names).toBeUndefined();
+  });
+
+  it("keeps a saved vector store that the store list no longer returns", async () => {
+    const user = setup();
+    renderModal({ ...accessGroup, access_vector_store_ids: ["retired-store", "store-old"] });
+    await screen.findByDisplayValue("Engineering");
+
+    await user.click(screen.getByRole("tab", { name: /Vector Stores/ }));
+    expect(await screen.findByLabelText("retired-store")).toHaveAttribute("data-slot", "combobox-chip");
+    await pickVectorStore(user, "New store (store-new)");
+    await save(user);
+
+    await waitFor(() => expect(mutate).toHaveBeenCalled());
+    expect(variables().params.access_vector_store_ids).toStrictEqual(["retired-store", "store-old", "store-new"]);
+  });
+
+  it("sends an empty list when every vector store is removed on the Vector Stores tab", async () => {
+    const user = setup();
+    renderModal();
+    await screen.findByDisplayValue("Engineering");
+
+    await user.click(screen.getByRole("tab", { name: /Vector Stores/ }));
+    await user.click(within(await screen.findByLabelText("Old store (store-old)")).getByRole("button"));
+    await save(user);
+
+    await waitFor(() => expect(mutate).toHaveBeenCalled());
+    expect(variables().params.access_vector_store_ids).toStrictEqual([]);
+  });
+
   it("sends a tab's field only once that tab has been visited", async () => {
     const user = setup();
     renderModal();
@@ -163,6 +223,7 @@ describe("AccessGroupEditModal submit payload", () => {
       access_mcp_server_ids: ["srv-1"],
       access_agent_ids: ["agent-1"],
       access_skill_names: undefined,
+      access_vector_store_ids: undefined,
     });
   });
 

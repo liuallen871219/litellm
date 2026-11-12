@@ -14,6 +14,7 @@ const mockAccessGroups: AccessGroupResponse[] = [
     access_mcp_server_ids: ["s1"],
     access_agent_ids: ["a1"],
     access_skill_names: [],
+    access_vector_store_ids: ["store-a", "store-b"],
     assigned_team_ids: [],
     assigned_key_ids: [],
     access_mcp_servers: [{ id: "s1", name: "Server One" }],
@@ -33,6 +34,7 @@ const mockAccessGroups: AccessGroupResponse[] = [
     access_mcp_server_ids: [],
     access_agent_ids: [],
     access_skill_names: [],
+    access_vector_store_ids: [],
     assigned_team_ids: [],
     assigned_key_ids: [],
     access_mcp_servers: [],
@@ -103,6 +105,13 @@ describe("AccessGroupsPage", () => {
     mockUseAccessGroups.mockReturnValue({ data: mockAccessGroups, isLoading: false });
     mockUseDeleteAccessGroup.mockReturnValue({ mutate: mockMutate, isPending: false });
     mockUseAuthorized.mockReturnValue({ userRole: "Admin", accessToken: "sk-test" });
+  });
+
+  it("shows how many vector stores each group grants", () => {
+    renderWithProviders(<AccessGroupsPage />);
+
+    expect(screen.getByTitle("2 Vector Stores")).toHaveTextContent("2");
+    expect(screen.getByTitle("0 Vector Stores")).toHaveTextContent("0");
   });
 
   it("renders the page title and subtitle", () => {

@@ -63,6 +63,7 @@ const createMockAccessGroup = (overrides: Partial<AccessGroupResponse> = {}): Ac
   access_mcp_servers: [{ id: "mcp-1", name: "GitHub MCP" }],
   access_agents: [{ id: "agent-1", name: "Support Agent" }],
   access_skill_names: ["private-plugin"],
+  access_vector_store_ids: ["store-a", "store-b", "store-c"],
   assigned_teams: [{ id: "team-1", name: "Platform Team" }],
   assigned_keys: [
     { id: "key-1", name: "ci-key" },
@@ -477,6 +478,29 @@ describe("AccessGroupDetail", () => {
       await user.click(screen.getByRole("tab", { name: /Skills/i }));
 
       expect(screen.getByText("No skills assigned to this group")).toBeInTheDocument();
+    });
+  });
+
+  describe("Vector Stores tab", () => {
+    it("should count and list the vector store ids granted by the group", async () => {
+      const user = userEvent.setup();
+      renderWithProviders(<AccessGroupDetail accessGroupId={accessGroupId} onBack={mockOnBack} />);
+
+      const tab = screen.getByRole("tab", { name: /Vector Stores/i });
+      expect(tab).toHaveTextContent("3");
+      await user.click(tab);
+
+      expect(screen.getByText("store-a")).toBeInTheDocument();
+      expect(screen.getByText("store-c")).toBeInTheDocument();
+    });
+
+    it("should show empty state when none assigned", async () => {
+      const user = userEvent.setup();
+      renderWith({ access_vector_store_ids: [] });
+
+      await user.click(screen.getByRole("tab", { name: /Vector Stores/i }));
+
+      expect(screen.getByText("No vector stores assigned to this group")).toBeInTheDocument();
     });
   });
 

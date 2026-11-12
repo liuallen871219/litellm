@@ -11,6 +11,13 @@ vi.mock("@/components/ModelSelect/ModelSelect", () => ({
     </button>
   ),
 }));
+vi.mock("@/components/vector_store_management/VectorStoreSelector", () => ({
+  default: ({ onChange }: { onChange: (values: string[]) => void }) => (
+    <button type="button" onClick={() => onChange(["store-a"])}>
+      set-vector-stores
+    </button>
+  ),
+}));
 vi.mock("@/app/(dashboard)/hooks/agents/useAgents", () => ({
   useAgents: () => ({ data: { agents: [{ agent_id: "agent-1", agent_name: "Support Agent" }] } }),
 }));
@@ -120,6 +127,22 @@ describe("AccessGroupCreateDialog", () => {
       access_group_name: "mcp-group",
       access_mcp_server_ids: ["srv-1"],
       access_agent_ids: ["agent-1"],
+    });
+  });
+
+  it("sends the vector stores picked on the Vector Stores tab", async () => {
+    const user = userEvent.setup();
+    const { createAccessGroup } = renderDialog();
+
+    await user.type(screen.getByLabelText("Group Name"), "kb-readers");
+    await user.click(screen.getByRole("tab", { name: "Vector Stores" }));
+    await user.click(screen.getByRole("button", { name: "set-vector-stores" }));
+    await user.click(screen.getByRole("button", { name: "Create Group" }));
+
+    await waitFor(() => expect(createAccessGroup).toHaveBeenCalledTimes(1));
+    expect(createAccessGroup.mock.calls[0][0]).toStrictEqual({
+      access_group_name: "kb-readers",
+      access_vector_store_ids: ["store-a"],
     });
   });
 
