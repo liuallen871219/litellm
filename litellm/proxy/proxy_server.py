@@ -421,6 +421,7 @@ from litellm.llms.anthropic.messages.convertible_blocks import (
 )
 from litellm.llms.custom_httpx.aiohttp_pool_diagnostics import build_pool_wait_trace_config
 from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler, HTTPHandler, exclude_rsa_key_exchange_and_chacha20
+from litellm.llms.custom_httpx.httpx_handler import HTTPHandler as JwksHTTPHandler
 from litellm.llms.openai.live import parse_live_session_start
 from litellm.llms.openai_like.model_info import MODEL_INFO_REFRESH_SECONDS
 from litellm.llms.vertex_ai.vertex_llm_base import VertexBase
@@ -457,7 +458,6 @@ from litellm.proxy.auth.auth_utils import (
 from litellm.proxy.auth.fallback_budget import RouterFallbackBudgetCheck, router_fallback_budget_check
 from litellm.proxy.auth.fallback_model_access import router_fallback_access_check
 from litellm.proxy.auth.fallback_rate_limit import RouterFallbackRateLimitCheck
-from litellm.proxy.auth.handle_jwt import JWTHandler
 from litellm.proxy.auth.legacy_empty_models_check import warn_about_legacy_empty_models
 from litellm.proxy.auth.litellm_license import AUTO_ROUTER_LICENSE_REMEDY, LicenseCheck
 from litellm.proxy.auth.login_throttle import (
@@ -1469,7 +1469,7 @@ async def proxy_shutdown_event(worker_heartbeat: ProxyWorkerHeartbeat | None = N
     if litellm.cache is not None:
         await litellm.cache.disconnect()
 
-    await jwt_handler.close()
+    await jwt_http_handler.close()
 
     if db_writer_client is not None:
         await db_writer_client.close()
@@ -1635,7 +1635,8 @@ async def _proxy_lifespan(app: FastAPI, resources: AsyncExitStack) -> AsyncGener
         premium_user, \
         _license_check, \
         proxy_batch_polling_interval, \
-        shared_aiohttp_session
+        shared_aiohttp_session, \
+        ui_login_enabled
     import json
 
     resources.callback(_forget_prisma_client)
@@ -1890,6 +1891,8 @@ async def _proxy_lifespan(app: FastAPI, resources: AsyncExitStack) -> AsyncGener
         verbose_proxy_logger.debug("After semantic tool filter initialization")
     except Exception as e:
         verbose_proxy_logger.error("Semantic filter init failed: %s", e, exc_info=True)
+
+    ui_login_enabled = get_secret_bool("EXPERIMENTAL_UI_LOGIN") is not False
 
     ## JWT AUTH ##
     ProxyStartupEvent.initialize_jwt_auth(
@@ -3278,7 +3281,9 @@ _BATCH_WRITE_JITTER_MAX_SECONDS: Final = 5
 proxy_config_reload_interval_seconds = PROXY_CONFIG_RELOAD_INTERVAL_SECONDS
 litellm_master_key_hash = None
 disable_spend_logs = False
-jwt_handler: Final = JWTHandler()
+litellm_jwtauth: LiteLLM_JWTAuth = LiteLLM_JWTAuth()
+jwt_http_handler: Final = JwksHTTPHandler()
+ui_login_enabled: bool = True
 prompt_injection_detection_obj: Final[OPTIONAL_PromptInjectionDetection | None] = None
 store_model_in_db: bool = False
 open_telemetry_logger: OpenTelemetry | None = None
@@ -5870,7 +5875,7 @@ def _bind_general_settings_store(settings: SettingsStore) -> None:
     general_settings = settings  # pyright: ignore[reportAssignmentType]  # legacy global accepts mappings
 
 
-def _current_general_settings() -> Mapping[str, object]:
+def current_general_settings() -> Mapping[str, object]:
     """The live ``general_settings``, whichever object a config reload has bound since the caller was created."""
     return general_settings
 
@@ -11420,6 +11425,7 @@ class ProxyStartupEvent:
         user_api_key_cache: UserApiKeyCache,
     ):
         """Initialize JWT auth on startup"""
+        global litellm_jwtauth
         declared_jwtauth: Final = general_settings.get("litellm_jwtauth", None)
         if declared_jwtauth is not None:
             resolved_jwtauth: Final = {
@@ -11437,14 +11443,6 @@ class ProxyStartupEvent:
             )
         else:
             litellm_jwtauth = LiteLLM_JWTAuth()
-        jwt_handler.update_environment(
-            prisma_client=prisma_client,
-            user_api_key_cache=user_api_key_cache,
-            litellm_jwtauth=litellm_jwtauth,
-        )
-        from litellm.proxy.agent_endpoints.agent_registry import global_agent_registry
-
-        jwt_handler.bind_agent_lookup(global_agent_registry)
 
     _initialize_jwt_auth = initialize_jwt_auth
 
@@ -11916,14 +11914,14 @@ class ProxyStartupEvent:
             scheduler=scheduler,
             proxy_logging_obj=proxy_logging_obj,
             prisma_client=prisma_client,
-            read_general_settings=_current_general_settings,
+            read_general_settings=current_general_settings,
         )
 
         from litellm.proxy.spend_tracking.performance_alerts import RUN_INTERVAL, run_performance_alerts
         from litellm.repositories.performance_alert_repository import PerformanceAlertRepository
 
         async def run_performance_alerts_job() -> None:
-            if _current_general_settings().get("performance_alerts_enabled", True) is True:
+            if current_general_settings().get("performance_alerts_enabled", True) is True:
                 await run_performance_alerts(PerformanceAlertRepository(prisma_client, enterprise=premium_user is True))
 
         scheduler.add_job(  # pyright: ignore[reportUnknownMemberType]  # APScheduler does not provide typed job methods
@@ -11980,7 +11978,7 @@ class ProxyStartupEvent:
             )
 
         ### SPEND LOG CLEANUP ###
-        cleanup_settings: Final = _current_general_settings()
+        cleanup_settings: Final = current_general_settings()
         _register_spend_log_cleanup_jobs(scheduler, prisma_client, cleanup_settings)  # pyright: ignore[reportUnknownArgumentType, reportArgumentType]  # apscheduler is untyped
         if _wants_cleanup_jobs(cleanup_settings):
             proxy_config.record_cleanup_schedule_attempt(cleanup_settings)
