@@ -605,6 +605,37 @@ async fn a_failed_post_call_increment_drops_the_counter_from_memory() {
 
 #[rstest]
 #[tokio::test]
+async fn the_request_tracks_only_its_committed_spend_charges_until_they_land(
+    #[values(Topology::Standalone, Topology::Cluster)] topology: Topology,
+) {
+    let deployment = RedisDeployment::start(topology).await.unwrap();
+    let store = store(Some(connect(&deployment)));
+    let live_only = RequestRedis::new(Handle::current(), LONG_DEADLINE);
+    let charged = RequestRedis::new(Handle::current(), LONG_DEADLINE);
+
+    store
+        .increment_many_post_call(&live_only, &[(team("t"), Number::Float(1.0))])
+        .unwrap();
+    store
+        .increment_many_post_call(
+            &charged,
+            &[
+                (team("t"), Number::Float(1.0)),
+                (committed(team("t")), Number::Float(1.0)),
+            ],
+        )
+        .unwrap();
+    let before_the_batch_went_out = charged.tracked_writes_settled();
+    live_only.flush_post().await;
+    charged.flush_post().await;
+
+    assert!(!before_the_batch_went_out);
+    assert!(!live_only.tracked_writes_settled());
+    assert!(charged.tracked_writes_settled());
+}
+
+#[rstest]
+#[tokio::test]
 async fn a_post_call_settlement_settles_when_the_deadline_sends_the_batch(
     #[values(Topology::Standalone, Topology::Cluster)] topology: Topology,
 ) {

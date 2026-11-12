@@ -4,7 +4,7 @@ mod types;
 use std::{
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -13,9 +13,9 @@ use litellm_python_compat::repr::to_str;
 use litellm_redis_client::{Declared, Expiry, RedisBatch, commands};
 
 pub use self::keys::{NotASpendCounter, SpendCounter};
-pub use self::types::{LostSeed, PostCallSettlement, Reading};
+pub use self::types::{LostSeed, Reading};
 use crate::{
-    Error, Number, Pending, RequestRedis, Send,
+    Error, Number, Pending, PostCallSettlement, RequestRedis, Send,
     dual_cache::{DualCache, MemorySettings},
     memory::{Clock, system_clock},
     remote::{Remote, RemoteSlot},
@@ -210,7 +210,9 @@ impl SpendCounters {
 
     /// `increment_many` on the request's post-call batch. Each total reaches memory once the batch
     /// goes out, and a counter whose increment failed is dropped everywhere. `None` without Redis,
-    /// else a settlement that reports when every reply is back, whoever flushed the batch.
+    /// else a settlement that reports when every reply is back, whoever flushed the batch. The
+    /// request tracks it when a committed counter is among the increments, so a reader later in the
+    /// request knows whether its own charge reached Redis.
     pub fn increment_many_post_call(
         self: &Arc<Self>,
         request: &RequestRedis,
@@ -230,8 +232,14 @@ impl SpendCounters {
             })
             .collect::<Vec<_>>();
         let store = Arc::clone(self);
-        let settled = Arc::new(AtomicBool::new(false));
-        let settlement = PostCallSettlement(Arc::clone(&settled));
+        let settlement = PostCallSettlement::default();
+        if increments
+            .iter()
+            .any(|(counter, _)| matches!(counter, SpendCounter::Committed(_)))
+        {
+            request.track(settlement.clone());
+        }
+        let settled = settlement.clone();
         request.spawn(async move {
             for (counter, total) in declared {
                 match total.settled().await {
@@ -250,7 +258,7 @@ impl SpendCounters {
                     }
                 }
             }
-            settled.store(true, Ordering::Release);
+            settled.settle();
         });
         Some(settlement)
     }

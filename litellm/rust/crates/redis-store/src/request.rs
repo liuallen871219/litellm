@@ -1,7 +1,10 @@
 use std::{
     collections::HashSet,
     future::Future,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex, Weak,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -26,6 +29,55 @@ struct Shared {
     batches: Mutex<Vec<ClientBatches>>,
     follow_ups: Mutex<Vec<JoinHandle<()>>>,
     deadline: Mutex<Option<oneshot::Sender<()>>>,
+    flushing_post: tokio::sync::Mutex<()>,
+    drain: PostCallDrain,
+    settlements: Mutex<Vec<PostCallSettlement>>,
+}
+
+/// The requests whose post-call batch holds ops not sent yet, so a shutdown sends them before Redis
+/// goes away. A request joins when a post-call declaration arms its deadline and leaves once a
+/// flush has its post-call writes back with nothing declared since.
+#[derive(Clone, Default)]
+pub struct PostCallDrain(Arc<Mutex<Vec<Weak<Shared>>>>);
+
+impl PostCallDrain {
+    pub async fn drain(&self) {
+        let open: Vec<RequestRedis> = lock(&self.0)
+            .iter()
+            .filter_map(Weak::upgrade)
+            .map(RequestRedis)
+            .collect();
+        join_all(open.iter().map(RequestRedis::flush_post)).await;
+    }
+
+    fn open(&self, request: &Arc<Shared>) {
+        let mut open = lock(&self.0);
+        if !open
+            .iter()
+            .any(|held| std::ptr::eq(held.as_ptr(), Arc::as_ptr(request)))
+        {
+            open.push(Arc::downgrade(request));
+        }
+    }
+
+    fn close(&self, request: &Arc<Shared>) {
+        lock(&self.0).retain(|open| !std::ptr::eq(open.as_ptr(), Arc::as_ptr(request)));
+    }
+}
+
+/// Post-call writes a later reader in the same request must know have landed, such as its own
+/// committed spend charge: settled once every reply is back, whoever sent the batch.
+#[derive(Clone, Debug, Default)]
+pub struct PostCallSettlement(Arc<AtomicBool>);
+
+impl PostCallSettlement {
+    pub fn is_settled(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn settle(&self) {
+        self.0.store(true, Ordering::Release);
+    }
 }
 
 #[derive(Clone)]
@@ -60,16 +112,23 @@ impl RequestRedis {
     /// Python one that has no Tokio context. Work spawned for the request logs to the subscriber
     /// current here, since a declaring thread may have none.
     pub fn new(runtime: Handle, post_call_deadline: Duration) -> Self {
-        Self::with_deadline_tag(runtime, post_call_deadline, Arc::new(|| None))
+        Self::hosted(
+            runtime,
+            post_call_deadline,
+            Arc::new(|| None),
+            PostCallDrain::default(),
+        )
     }
 
-    /// As `new`, with the deadline's flush of the post-call batch run inside the tag `deadline_tag`
-    /// gives for the declaration that armed it, as an explicit `flush_post` runs inside its
-    /// caller's.
-    pub fn with_deadline_tag(
+    /// As `new`, for the host that owns the request: the deadline's flush of the post-call batch
+    /// runs inside the tag `deadline_tag` gives for the declaration that armed it, as an explicit
+    /// `flush_post` runs inside its caller's, and `drain` sends the batch at shutdown if nothing
+    /// else has.
+    pub fn hosted(
         runtime: Handle,
         post_call_deadline: Duration,
         deadline_tag: DeadlineTag,
+        drain: PostCallDrain,
     ) -> Self {
         Self(Arc::new(Shared {
             runtime,
@@ -79,6 +138,9 @@ impl RequestRedis {
             batches: Mutex::new(Vec::new()),
             follow_ups: Mutex::new(Vec::new()),
             deadline: Mutex::new(None),
+            flushing_post: tokio::sync::Mutex::new(()),
+            drain,
+            settlements: Mutex::new(Vec::new()),
         }))
     }
 
@@ -118,6 +180,17 @@ impl RequestRedis {
         );
     }
 
+    /// A post-call write a later reader in this request waits on; see `tracked_writes_settled`.
+    pub(crate) fn track(&self, settlement: PostCallSettlement) {
+        lock(&self.0.settlements).push(settlement);
+    }
+
+    /// Whether every tracked post-call write has landed; `false` while none was tracked.
+    pub fn tracked_writes_settled(&self) -> bool {
+        let settlements = lock(&self.0.settlements);
+        !settlements.is_empty() && settlements.iter().all(PostCallSettlement::is_settled)
+    }
+
     fn logged<F: Future>(&self, task: F) -> impl Future<Output = F::Output> + use<F> {
         task.in_current_span().with_subscriber(self.0.logs.clone())
     }
@@ -127,8 +200,11 @@ impl RequestRedis {
     }
 
     /// Sends every post-call op declared so far and waits for the follow-ups spawned on them; the
-    /// shutdown drain calls it too.
+    /// shutdown drain calls it too. One flush runs at a time and the request stays in the drain
+    /// until it is done, so a drain that overlaps a flush waits for its writes. An op declared
+    /// while it runs arms a new deadline and keeps the request in the drain.
     pub async fn flush_post(&self) {
+        let _flushing = self.0.flushing_post.lock().await;
         lock(&self.0.deadline).take();
         let follow_ups = std::mem::take(&mut *lock(&self.0.follow_ups));
         join_all(self.batches().iter().map(|batches| batches.post.flush())).await;
@@ -137,6 +213,10 @@ impl RequestRedis {
             .into_iter()
             .filter_map(Result::err)
             .for_each(|error| tracing::warn!(%error, "a post-call follow-up failed"));
+        let deadline = lock(&self.0.deadline);
+        if deadline.is_none() {
+            self.0.drain.close(&self.0);
+        }
     }
 
     fn batches(&self) -> Vec<ClientBatches> {
@@ -174,6 +254,7 @@ impl RequestRedis {
         }
         let (disarm, disarmed) = oneshot::channel();
         *deadline = Some(disarm);
+        self.0.drain.open(&self.0);
         let request = self.clone();
         self.0.runtime.spawn(self.logged(async move {
             tokio::select! {
