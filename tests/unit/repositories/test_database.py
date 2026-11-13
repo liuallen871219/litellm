@@ -1,8 +1,11 @@
+import asyncio
+import logging
 from typing import Final
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from litellm._logging import verbose_proxy_logger
 from litellm.proxy.db.connection_budget import RustConnectionLimits
 from litellm.proxy.db.pgbouncer import PGBOUNCER_POOLED_ENV_VAR
 from litellm.repositories.database import Database
@@ -80,3 +83,22 @@ async def test_rejected_reader_settings_still_close_prisma() -> None:
         await Database.open(_prisma(aclose), WRITER_URL, "postgresql://replica.invalid/proxy", RustConnectionLimits())
 
     aclose.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("static_password")
+async def test_an_unreachable_native_pool_is_reported_without_failing_boot(caplog: pytest.LogCaptureFixture) -> None:
+    with caplog.at_level(logging.WARNING, logger=verbose_proxy_logger.name):
+        database: Final = await Database.open(
+            _prisma(), "postgresql://litellm:secret@127.0.0.1:1/proxy?pool_timeout=1", None, RustConnectionLimits()
+        )
+        await asyncio.wait_for(database.boot_probe, timeout=10)
+        await database.aclose()
+
+    assert [
+        record.getMessage() for record in caplog.records if "Native database pool cannot reach" in record.getMessage()
+    ] == [
+        "Native database pool cannot reach the database, so operations ported to it will fail until it connects."
+        " Prisma is checked separately. Cause: database query failed: pool timed out while waiting for an open"
+        " connection"
+    ]
