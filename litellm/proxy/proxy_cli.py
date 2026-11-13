@@ -1638,6 +1638,7 @@ def run_server(
 
         if os.getenv("DATABASE_URL", None) is not None or os.getenv("DIRECT_URL", None) is not None:
             from litellm.proxy.db.connection_budget import (
+                RUST_READER_CONNECTION_LIMIT_ENV_VAR,
                 RUST_WRITER_CONNECTION_LIMIT_ENV_VAR,
                 ConnectionBudget,
                 RustConnectionLimits,
@@ -1728,7 +1729,18 @@ def run_server(
             # on the writer. Anything pinned on the replica URL wins, unlike the
             # writer where the config is applied on top.
             read_replica_url: Final[str | None] = os.getenv("DATABASE_URL_READ_REPLICA")
-            if read_replica_url:
+            reader_budget: Final = (
+                ConnectionBudget.split(
+                    TypeAdapter(PositiveInt).validate_python(
+                        _url_query_value(read_replica_url, "connection_limit") or writer_budget.total
+                    ),
+                    rust_reserved=rust_reserved.reader_connection_limit,
+                )
+                if read_replica_url
+                else None
+            )
+            if read_replica_url and reader_budget is not None:
+                os.environ[RUST_READER_CONNECTION_LIMIT_ENV_VAR] = str(reader_budget.rust)
                 reader_options: Final[str] = _pg_options_with_timeouts(
                     _url_query_value(read_replica_url, "options"),
                     db_statement_timeout,
@@ -1738,9 +1750,13 @@ def run_server(
                 os.environ["DATABASE_URL_READ_REPLICA"] = translate_libpq_ssl_params(
                     add_missing_query_params(
                         add_missing_query_params(
-                            _with_query_value(read_replica_url, "options", reader_options)
-                            if reader_options
-                            else read_replica_url,
+                            _with_query_value(
+                                _with_query_value(read_replica_url, "options", reader_options)
+                                if reader_options
+                                else read_replica_url,
+                                "connection_limit",
+                                str(reader_budget.python),
+                            ),
                             reader_shareable_params(prisma_url_params),
                         ),
                         prisma_default_params,
@@ -1757,6 +1773,7 @@ def run_server(
                     )
                     if read_replica_url
                     else None,
+                    rust_reader_limit=reader_budget.rust if reader_budget is not None else 0,
                     num_workers=f"{1 if run_hypercorn else num_workers}",
                 )
             )

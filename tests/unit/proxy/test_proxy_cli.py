@@ -3477,6 +3477,7 @@ _CAPTURED_DB_ENV_VARS = (
     "DIRECT_URL",
     "DATABASE_URL_READ_REPLICA",
     "LITELLM_DATABASE_RUST_WRITER_CONNECTION_LIMIT",
+    "LITELLM_DATABASE_RUST_READER_CONNECTION_LIMIT",
 )
 
 
@@ -3487,6 +3488,7 @@ def _run_server_and_capture_urls(
     read_replica_url: str | None = None,
     extra_args: tuple[str, ...] = (),
     rust_writer_connection_limit: str | None = None,
+    rust_reader_connection_limit: str | None = None,
 ) -> dict:
     loaded_config = yaml.safe_load(Path(config_path).read_text())
     mock_proxy_config = MagicMock()
@@ -3505,6 +3507,8 @@ def _run_server_and_capture_urls(
         clean_env["DATABASE_URL_READ_REPLICA"] = read_replica_url
     if rust_writer_connection_limit is not None:
         clean_env["LITELLM_DATABASE_RUST_WRITER_CONNECTION_LIMIT"] = rust_writer_connection_limit
+    if rust_reader_connection_limit is not None:
+        clean_env["LITELLM_DATABASE_RUST_READER_CONNECTION_LIMIT"] = rust_reader_connection_limit
 
     with (
         patch.dict(os.environ, clean_env, clear=True),
@@ -3655,7 +3659,8 @@ class TestReadReplicaConnectionParams:
 
     def test_operator_pinned_replica_params_win(self, tmp_path):
         """The documented workaround (params pinned on the replica URL) must keep
-        working, so an operator who tuned the reader separately is not overridden.
+        working, so an operator who tuned the reader separately is not overridden. A pinned
+        connection_limit is the reader's whole budget, shared with the Rust reader pool.
         """
         import yaml
 
@@ -3678,8 +3683,25 @@ class TestReadReplicaConnectionParams:
         )
 
         query = urlparse.parse_qs(urlparse.urlparse(captured["DATABASE_URL_READ_REPLICA"]).query)
-        assert query["connection_limit"] == ["50"]
+        assert int(query["connection_limit"][0]) + int(captured["LITELLM_DATABASE_RUST_READER_CONNECTION_LIMIT"]) == 50
         assert query["pool_timeout"] == ["20"]
+
+    def test_operator_set_rust_share_is_carved_out_of_the_reader_limit(self, tmp_path: Path) -> None:
+        config_path: Final = tmp_path / "config.yaml"
+        config_path.write_text(yaml.dump({"model_list": [], "general_settings": {}}))
+
+        captured: Final = _CAPTURED_URLS.validate_python(
+            _run_server_and_capture_urls(
+                str(config_path),
+                read_replica_url="postgresql://t:t@reader:5432/t?connection_limit=12",
+                rust_reader_connection_limit="5",
+            )
+        )
+
+        reader: Final = urlparse.parse_qs(urlparse.urlparse(captured["DATABASE_URL_READ_REPLICA"]).query)
+        writer: Final = urlparse.parse_qs(urlparse.urlparse(captured["DATABASE_URL"]).query)
+        assert (reader["connection_limit"], captured["LITELLM_DATABASE_RUST_READER_CONNECTION_LIMIT"]) == (["7"], "5")
+        assert (writer["connection_limit"], captured["LITELLM_DATABASE_RUST_WRITER_CONNECTION_LIMIT"]) == (["8"], "2")
 
     def test_connection_budget_line_counts_the_limits_the_final_urls_carry(
         self,
@@ -3697,7 +3719,7 @@ class TestReadReplicaConnectionParams:
         )
 
         assert (
-            "1 worker(s) x (writer connection_limit 1 + rust writer pool 2 + reader connection_limit 50) = up to 53 connections"
+            "1 worker(s) x (writer connection_limit 1 + rust writer pool 2 + reader connection_limit 48 + rust reader pool 2) = up to 53 connections"
             in capsys.readouterr().out
         )
 

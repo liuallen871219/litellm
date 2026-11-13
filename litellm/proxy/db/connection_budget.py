@@ -7,8 +7,9 @@ queries next to ported ones. These invariants hold until Prisma is gone:
   `database_extra_connection_params`). The Rust share is carved out of it, never added on top, so a Rust
   pool does not grow the connection budget.
 - The Rust share defaults to `RUST_RESERVED_CONNECTIONS`. An operator moves connections from Prisma to the
-  Rust pool by setting `LITELLM_DATABASE_RUST_WRITER_CONNECTION_LIMIT` before startup, and `proxy_cli`
-  clamps it so Prisma keeps at least one.
+  Rust pool by setting `LITELLM_DATABASE_RUST_WRITER_CONNECTION_LIMIT` or
+  `LITELLM_DATABASE_RUST_READER_CONNECTION_LIMIT` before startup, and `proxy_cli` clamps it so Prisma keeps at
+  least one.
 - The split is Python's. It is about Prisma and Prisma lives only in the Python gateway, so this module is
   deleted with Prisma. The process that starts the workers (`proxy_cli`) decides it once and hands each
   worker plain numbers.
@@ -26,6 +27,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 RUST_RESERVED_CONNECTIONS: Final = 2
 RUST_CONNECTION_LIMIT_ENV_PREFIX: Final = "LITELLM_DATABASE_RUST_"
 RUST_WRITER_CONNECTION_LIMIT_ENV_VAR: Final = f"{RUST_CONNECTION_LIMIT_ENV_PREFIX}WRITER_CONNECTION_LIMIT"
+RUST_READER_CONNECTION_LIMIT_ENV_VAR: Final = f"{RUST_CONNECTION_LIMIT_ENV_PREFIX}READER_CONNECTION_LIMIT"
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,3 +53,4 @@ class RustConnectionLimits(BaseSettings):
     model_config = SettingsConfigDict(env_prefix=RUST_CONNECTION_LIMIT_ENV_PREFIX, extra="ignore", frozen=True)
 
     writer_connection_limit: PositiveInt = RUST_RESERVED_CONNECTIONS
+    reader_connection_limit: PositiveInt = RUST_RESERVED_CONNECTIONS

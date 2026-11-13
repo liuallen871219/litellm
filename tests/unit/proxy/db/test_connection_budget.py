@@ -25,7 +25,10 @@ def test_split_takes_the_rust_reserve_out_of_the_total(total: int, rust_reserved
     assert (budget.python, budget.rust) == (python, rust)
 
 
-def test_workers_read_the_rust_share_proxy_cli_exported(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_workers_read_the_rust_shares_proxy_cli_exported(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("LITELLM_DATABASE_RUST_WRITER_CONNECTION_LIMIT", "3")
+    monkeypatch.setenv("LITELLM_DATABASE_RUST_READER_CONNECTION_LIMIT", "1")
 
-    assert RustConnectionLimits().writer_connection_limit == 3
+    limits: Final = RustConnectionLimits()
+
+    assert (limits.writer_connection_limit, limits.reader_connection_limit) == (3, 1)
