@@ -514,4 +514,41 @@ mod tests {
         outer.rollback().await?;
         Ok(())
     }
+
+    #[rstest]
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL pointing to a Prisma-migrated PostgreSQL database"]
+    async fn row_timestamps_are_utc_whatever_the_session_time_zone(
+        logs: [SpendLog; 2],
+        #[future(awt)] database_pool: Result<PgPool, Box<dyn StdError>>,
+    ) -> Result<(), Box<dyn StdError>> {
+        let pool = database_pool?;
+        let mut tx = pool.begin().await?;
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "The test moves the session off UTC at runtime"
+        )]
+        sqlx::raw_sql("SET LOCAL TIME ZONE 'Asia/Kolkata'")
+            .execute(&mut *tx)
+            .await?;
+        insert_spend_logs(&mut *tx, &logs).await?;
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "Test assertions are outside the compile-checked query set"
+        )]
+        let (created_at, updated_at, utc_now): (
+            NaiveDateTime,
+            NaiveDateTime,
+            NaiveDateTime,
+        ) = sqlx::query_as(
+            r#"SELECT created_at, updated_at, (NOW() AT TIME ZONE 'UTC')::timestamp(3)
+                   FROM "LiteLLM_SpendLogs" WHERE request_id = $1"#,
+        )
+        .bind(&logs[0].request_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        assert_eq!((created_at, updated_at), (utc_now, utc_now));
+        tx.rollback().await?;
+        Ok(())
+    }
 }

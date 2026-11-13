@@ -254,12 +254,19 @@ def translate_libpq_ssl_params(url: str, resolve_root_cert: RootCertResolver = p
     return urllib.parse.urlunsplit(parsed._replace(query=query))
 
 
-def postgres_connection_budget_message(writer_limit: str, reader_limit: str | None, num_workers: str) -> str:
+PRISMA_APPLICATION_NAME: Final = "litellm-prisma"
+NATIVE_APPLICATION_NAME: Final = "litellm-native"
+
+
+def postgres_connection_budget_message(
+    writer_limit: str, rust_writer_limit: int, reader_limit: str | None, num_workers: str
+) -> str:
     """The startup line that states this pod's worst-case Postgres connection demand.
 
     Prisma's ``connection_limit`` is per query engine, and every uvicorn worker
     owns one engine per configured database (writer, plus the reader when
-    ``DATABASE_URL_READ_REPLICA`` is set). The limits are read off the final URLs,
+    ``DATABASE_URL_READ_REPLICA`` is set) plus the Rust writer pool's share
+    (``connection_budget``). The limits are read off the final URLs,
     so a reader that pins its own ``connection_limit`` or an operator override in
     ``database_extra_connection_params`` is counted at its real value. The
     server-side cap is shared by every pod, so the number an operator has to keep
@@ -272,16 +279,14 @@ def postgres_connection_budget_message(writer_limit: str, reader_limit: str | No
         reader: Final = int(reader_limit) if reader_limit is not None else 0
     except ValueError:
         return (
-            "LiteLLM Proxy: Postgres connection budget per pod = workers x (writer connection_limit + reader "
-            f"connection_limit) (workers={num_workers!r}, writer={writer_limit!r}, reader={reader_limit!r}); "
+            "LiteLLM Proxy: Postgres connection budget per pod = workers x (writer connection_limit + rust "
+            "writer pool + reader connection_limit) "
+            f"(workers={num_workers!r}, writer={writer_limit!r}, reader={reader_limit!r}); "
             "keep pods x that figure under max_connections minus superuser_reserved_connections"
         )
-    engines: Final = (
-        f"(writer connection_limit {writer} + reader connection_limit {reader})"
-        if reader_limit is not None
-        else f"writer connection_limit {writer}"
-    )
-    per_pod: Final = workers * (writer + reader)
+    pools: Final = f"writer connection_limit {writer} + rust writer pool {rust_writer_limit}"
+    engines: Final = f"({pools} + reader connection_limit {reader})" if reader_limit is not None else f"({pools})"
+    per_pod: Final = workers * (writer + rust_writer_limit + reader)
     return (
         f"LiteLLM Proxy: Postgres connection budget per pod = {workers} worker(s) x {engines} = up to {per_pod} "
         "connections; keep pods x that figure under max_connections minus superuser_reserved_connections"

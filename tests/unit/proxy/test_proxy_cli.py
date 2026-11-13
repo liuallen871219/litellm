@@ -16,6 +16,7 @@ import click
 import fastapi
 import httpx
 import pytest
+from pydantic import TypeAdapter
 
 
 import builtins
@@ -1034,7 +1035,7 @@ class TestProxyInitializationHelpers:
             assert result.exit_code == 0, f"exit_code={result.exit_code}, output={result.output}"
             mock_append_query_params.assert_called()
             appended_params = mock_append_query_params.call_args.args[1]
-            assert appended_params["connection_limit"] == 5
+            assert appended_params["connection_limit"] == 3
             assert appended_params["pool_timeout"] == expected_timeout
 
     def test_build_db_connection_url_params_defaults(self):
@@ -3471,7 +3472,12 @@ class TestPostgresStatementTimeoutOptions:
         return _run_server_and_capture_urls(config_path, database_url=database_url)["DATABASE_URL"]
 
 
-_CAPTURED_DB_ENV_VARS = ("DATABASE_URL", "DIRECT_URL", "DATABASE_URL_READ_REPLICA")
+_CAPTURED_DB_ENV_VARS = (
+    "DATABASE_URL",
+    "DIRECT_URL",
+    "DATABASE_URL_READ_REPLICA",
+    "LITELLM_DATABASE_RUST_WRITER_CONNECTION_LIMIT",
+)
 
 
 def _run_server_and_capture_urls(
@@ -3480,6 +3486,7 @@ def _run_server_and_capture_urls(
     direct_url: str | None = None,
     read_replica_url: str | None = None,
     extra_args: tuple[str, ...] = (),
+    rust_writer_connection_limit: str | None = None,
 ) -> dict:
     loaded_config = yaml.safe_load(Path(config_path).read_text())
     mock_proxy_config = MagicMock()
@@ -3496,6 +3503,8 @@ def _run_server_and_capture_urls(
         clean_env["DIRECT_URL"] = direct_url
     if read_replica_url is not None:
         clean_env["DATABASE_URL_READ_REPLICA"] = read_replica_url
+    if rust_writer_connection_limit is not None:
+        clean_env["LITELLM_DATABASE_RUST_WRITER_CONNECTION_LIMIT"] = rust_writer_connection_limit
 
     with (
         patch.dict(os.environ, clean_env, clear=True),
@@ -3516,6 +3525,91 @@ def _run_server_and_capture_urls(
             standalone_mode=False,
         )
         return {k: os.environ[k] for k in _CAPTURED_DB_ENV_VARS if k in os.environ}
+
+
+_CAPTURED_URLS: Final = TypeAdapter(dict[str, str])
+
+
+@pytest.mark.parametrize(
+    "general_settings, database_url, expected_prisma, expected_rust, expected_name, expected_total",
+    [
+        pytest.param({}, "postgresql://t:t@localhost:5432/t", "8", "2", "litellm-prisma", "10", id="default_ten_splits"),
+        pytest.param(
+            {"database_connection_pool_limit": 30},
+            "postgresql://t:t@localhost:5432/t?application_name=ops",
+            "28",
+            "2",
+            "ops",
+            "30",
+            id="configured_limit_and_operator_name",
+        ),
+        pytest.param(
+            {"database_extra_connection_params": {"connection_limit": 5}},
+            "postgresql://t:t@localhost:5432/t",
+            "3",
+            "2",
+            "litellm-prisma",
+            "5",
+            id="extra_params_override_splits",
+        ),
+        pytest.param(
+            {"database_connection_pool_limit": 2},
+            "postgresql://t:t@localhost:5432/t",
+            "1",
+            "1",
+            "litellm-prisma",
+            "2",
+            id="small_limit_stays_within_budget",
+        ),
+    ],
+)
+def test_prisma_and_rust_pools_split_the_connection_limit(
+    tmp_path: Path,
+    general_settings: dict[str, object],
+    database_url: str,
+    expected_prisma: str,
+    expected_rust: str,
+    expected_name: str,
+    expected_total: str,
+) -> None:
+    config_path: Final = tmp_path / "config.yaml"
+    config_path.write_text(yaml.dump({"model_list": [], "general_settings": general_settings}))
+
+    captured: Final = _CAPTURED_URLS.validate_python(
+        _run_server_and_capture_urls(
+            str(config_path), database_url=database_url, direct_url="postgresql://t:t@localhost:5432/t"
+        )
+    )
+
+    writer: Final = urlparse.parse_qs(urlparse.urlparse(captured["DATABASE_URL"]).query)
+    direct: Final = urlparse.parse_qs(urlparse.urlparse(captured["DIRECT_URL"]).query)
+    assert (writer["connection_limit"], writer["application_name"]) == ([expected_prisma], [expected_name])
+    assert captured["LITELLM_DATABASE_RUST_WRITER_CONNECTION_LIMIT"] == expected_rust
+    assert direct["connection_limit"] == [expected_total]
+
+
+@pytest.mark.parametrize(
+    "pool_limit, requested, expected_prisma, expected_rust",
+    [(10, "4", "6", "4"), (3, "9", "1", "2")],
+    ids=["share_moved_to_rust", "clamped_so_prisma_keeps_one"],
+)
+def test_operator_set_rust_share_is_carved_out_of_the_connection_limit(
+    tmp_path: Path, pool_limit: int, requested: str, expected_prisma: str, expected_rust: str
+) -> None:
+    config_path: Final = tmp_path / "config.yaml"
+    config_path.write_text(
+        yaml.dump({"model_list": [], "general_settings": {"database_connection_pool_limit": pool_limit}})
+    )
+
+    captured: Final = _CAPTURED_URLS.validate_python(
+        _run_server_and_capture_urls(str(config_path), rust_writer_connection_limit=requested)
+    )
+
+    writer: Final = urlparse.parse_qs(urlparse.urlparse(captured["DATABASE_URL"]).query)
+    assert (writer["connection_limit"], captured["LITELLM_DATABASE_RUST_WRITER_CONNECTION_LIMIT"]) == (
+        [expected_prisma],
+        expected_rust,
+    )
 
 
 class TestReadReplicaConnectionParams:
@@ -3551,7 +3645,8 @@ class TestReadReplicaConnectionParams:
         )
 
         query = urlparse.parse_qs(urlparse.urlparse(captured["DATABASE_URL_READ_REPLICA"]).query)
-        assert query["connection_limit"] == ["3"]
+        assert query["connection_limit"] == ["1"]
+        assert query["application_name"] == ["litellm-prisma"]
         assert query["pool_timeout"] == ["20"]
         assert query["connect_timeout"] == ["15"]
         assert query["socket_timeout"] == ["120"]
@@ -3602,7 +3697,7 @@ class TestReadReplicaConnectionParams:
         )
 
         assert (
-            "1 worker(s) x (writer connection_limit 3 + reader connection_limit 50) = up to 53 connections"
+            "1 worker(s) x (writer connection_limit 1 + rust writer pool 2 + reader connection_limit 50) = up to 53 connections"
             in capsys.readouterr().out
         )
 
@@ -3621,7 +3716,7 @@ class TestReadReplicaConnectionParams:
             extra_args=("--run_hypercorn", "--num_workers", "4"),
         )
 
-        assert "1 worker(s) x writer connection_limit 3 = up to 3 connections" in capsys.readouterr().out
+        assert "1 worker(s) x (writer connection_limit 1 + rust writer pool 2) = up to 3 connections" in capsys.readouterr().out
 
     def test_extra_connection_params_never_carry_a_schema_override_to_the_reader(self, tmp_path):
         """database_extra_connection_params is an untyped passthrough, so it can carry a
@@ -3655,7 +3750,7 @@ class TestReadReplicaConnectionParams:
         assert writer_query["schema"] == ["writer_schema"]
 
         reader_query = urlparse.parse_qs(urlparse.urlparse(captured["DATABASE_URL_READ_REPLICA"]).query)
-        assert reader_query["connection_limit"] == ["3"]
+        assert reader_query["connection_limit"] == ["1"]
         assert reader_query["socket_timeout"] == ["90"]
         assert "options" not in reader_query
         assert "schema" not in reader_query
