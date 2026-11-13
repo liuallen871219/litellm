@@ -256,6 +256,34 @@ fn refreshing_a_key_behind_an_earlier_live_key_keeps_the_heap_bounded(clock: Clo
 }
 
 #[rstest]
+fn a_ttl_past_the_end_of_time_never_expires_and_leaves_the_cache_usable(clock: Clock) {
+    let cache = cache(&clock, 3);
+    let forever = ExactCacheContext {
+        ttl: Some(Duration::MAX),
+    };
+    cache
+        .set_cache("set", "a".into(), Some(Duration::MAX))
+        .unwrap();
+    cache
+        .claim_cache("claimed", "b".to_string(), &[], forever)
+        .unwrap();
+    at(&clock, 1_000_000_000);
+    cache.set_cache("after", "c".into(), secs(1)).unwrap();
+    assert_eq!(
+        (
+            cache.get_cache("set"),
+            cache.get_cache("claimed"),
+            cache.get_cache("after")
+        ),
+        (
+            Ok(Some("a".into())),
+            Ok(Some("b".into())),
+            Ok(Some("c".into()))
+        )
+    );
+}
+
+#[rstest]
 fn evict_cache_drops_expired_entries_then_makes_room(clock: Clock) {
     let cache = cache(&clock, 2);
     assert_eq!(cache.is_empty(), Ok(true));

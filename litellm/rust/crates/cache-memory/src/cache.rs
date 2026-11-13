@@ -280,6 +280,11 @@ impl<V: Clone> InMemoryCache<V> {
         }
     }
 
+    /// Python's `time.time() + ttl` never fails, so a TTL past the end of `Duration` never expires.
+    fn deadline(now: Duration, ttl: Duration) -> Duration {
+        now.checked_add(ttl).unwrap_or(Duration::MAX)
+    }
+
     fn set_expiration(state: &mut CacheState<V>, key: &str, expiration: Duration) {
         if state.expirations.get(key).copied() != Some(expiration) {
             state.expirations.insert(key.into(), expiration);
@@ -322,7 +327,11 @@ impl<V: Clone> InMemoryCache<V> {
         }
         let expiration = state.expirations.get(&key).copied();
         if expiration.is_none_or(|expiration| expiration < now) {
-            Self::set_expiration(state, &key, now + ttl.unwrap_or(self.default_ttl));
+            Self::set_expiration(
+                state,
+                &key,
+                Self::deadline(now, ttl.unwrap_or(self.default_ttl)),
+            );
         }
         state.values.insert(key, value);
         Ok(CacheWrite::Stored)
@@ -361,7 +370,7 @@ where
         Self::set_expiration(
             &mut state,
             key,
-            now + self.get_ttl(&context).unwrap_or(self.default_ttl),
+            Self::deadline(now, self.get_ttl(&context).unwrap_or(self.default_ttl)),
         );
         state.values.insert(key.into(), winner.clone());
         Ok(winner)
