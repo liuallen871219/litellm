@@ -3,15 +3,14 @@ mod increment;
 mod read;
 mod write;
 
-use std::{
-    sync::{Arc, Mutex},
-    time::Duration,
-};
+use std::{sync::Arc, time::Duration};
+
+use parking_lot::Mutex;
 
 pub use self::batch_read::TierPolicy;
 pub(crate) use self::{batch_read::BatchReads, increment::PipelineIncrement};
 use crate::{
-    memory::{Clock, Memory, lock},
+    memory::{Clock, Memory},
     remote::RemoteSlot,
 };
 
@@ -83,13 +82,13 @@ impl<V: Clone, R> DualCache<V, R> {
     }
 
     pub(crate) fn default_in_memory_ttl(&self) -> Option<Duration> {
-        *lock(&self.default_in_memory_ttl)
+        *self.default_in_memory_ttl.lock()
     }
 
     /// `DualCache.update_cache_ttl` and `update_in_memory_max_size` together: both apply in place,
     /// and the entries memory already holds stay.
     pub(crate) fn reconfigure(&self, memory: MemorySettings) {
-        *lock(&self.default_in_memory_ttl) = memory.ttl;
+        *self.default_in_memory_ttl.lock() = memory.ttl;
         self.memory.update_max_size(memory.entries);
     }
 }

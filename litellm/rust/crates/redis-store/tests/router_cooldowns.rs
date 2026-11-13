@@ -258,6 +258,28 @@ async fn a_router_without_redis_keeps_its_cooldowns_and_counts_in_memory() {
 }
 
 #[rstest]
+#[case::past_the_end_of_duration(1e300)]
+#[case::infinite(f64::INFINITY)]
+#[tokio::test]
+async fn a_cooldown_too_long_to_measure_stays_active(#[case] cooldown_time: f64) {
+    let store = std::sync::Arc::new(RouterCooldowns::with_clock(None, POLICY, fixture_clock()));
+    let [case, _] = cooldowns();
+    let cooldown = Cooldown {
+        cooldown_time: Number::Float(cooldown_time),
+        ..case.cooldown
+    };
+    store
+        .put(case.model_id, &cooldown, Duration::from_secs(90))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        read_active(&store, &[case.model_id.to_owned()]).await,
+        vec![(case.model_id.to_owned(), cooldown)]
+    );
+}
+
+#[rstest]
 #[tokio::test]
 async fn a_redis_outage_serves_memory_and_counts_fails_locally() {
     let deployment = RedisDeployment::start(Topology::Standalone).await.unwrap();
